@@ -1,0 +1,3 @@
+- insert:
+    - id: dsh-continue
+      name: 'dsh-plugin-continue'

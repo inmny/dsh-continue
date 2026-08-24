@@ -1,0 +1,98 @@
+{
+  "name": "dsh-plugin-continue",
+  "version": "0.1.0",
+  "description": "Add a direct no-input continuation control for failed DeepSeek Harness sessions",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "plugin",
+    "continue",
+    "resume",
+    "recovery",
+    "subagent"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./runtime": {
+      "types": "./lib/runtime.d.ts",
+      "default": "./lib/runtime.js"
+    },
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ]
+    }
+  },
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('lib', { recursive: true, force: true })\"",
+    "build": "pnpm run clean && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm run build && node --test --test-isolation=none",
+    "pack:check": "npm pack --dry-run",
+    "prepack": "pnpm run build",
+    "prepublishOnly": "pnpm test"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/dsh-agent": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-agent-default-model": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-agent-presets": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-client-connection": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-client-locale": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-client-runtime": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-client-ui-conversation": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-client-ui-primitives": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-host-apiproxy": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-session": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-session-persistence": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-subagent": "0.1.1-rc.1",
+    "react": "^18.2.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/dsh-agent": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-agent-default-model": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-agent-presets": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-client-connection": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-host-apiproxy": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-session": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-session-persistence": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-subagent": "0.1.1-rc.1",
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3"
+  },
+  "packageManager": "pnpm@11.9.0"
+}
