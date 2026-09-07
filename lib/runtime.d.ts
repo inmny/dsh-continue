@@ -14,7 +14,7 @@ export interface ContinueStatus {
 }
 export declare function clearLegacyContinuationWakes(agent: Agent): number;
 /** Classify the latest durable turn and reject sessions with unrelated pending input. */
-export declare function continueStatusFromEvents(events: readonly SessionEvent[], agent?: Agent, seedLength?: number): ContinueStatus;
+export declare function continueStatusFromEvents(events: readonly SessionEvent[], agent?: Agent, inheritedEventCount?: number): ContinueStatus;
 /**
  * Start a model turn with no inbox message. Returns false when the live Agent
  * changed after status admission or this DSH build lacks the private boundary.
