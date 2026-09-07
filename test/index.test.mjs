@@ -8,6 +8,7 @@ import {
   startContinuation,
 } from "../lib/index.js";
 import { Context } from "@deepseek-ai/cordis";
+import { queueSubagentPrompt } from "@deepseek-ai/dsh-subagent/internal";
 import { Session, SessionId } from "@deepseek-ai/dsh-session";
 
 function sessionWithReason(reason) {
@@ -98,54 +99,64 @@ function subagentWake(id = "subagent-wake") {
   };
 }
 
+function fakeSession(header, events, inheritedEventCount = 0) {
+  return {
+    header,
+    events,
+    inheritedEventCount,
+    snapshotEvents() {
+      return events;
+    },
+  };
+}
+
 function provideSubagents(ctx, overrides = {}) {
   ctx.provide("subagents", {
     listChildren: async () => [],
-    followup: async () => "subagent-message",
-    registerContinuableSetup: () => () => {},
+    [queueSubagentPrompt]: async () => "subagent-message",
     ...overrides,
   });
 }
 function childSession(id, parentId, suffix) {
-  return {
-    header: {
+  return fakeSession(
+    {
       id,
       parentSession: parentId,
-      seedLength: 1,
       origin: "subagent",
     },
-    events: [event(0, "turn/end", {
+    [event(0, "turn/end", {
       turn: 99,
       reason: { kind: "completed" },
     }), ...suffix],
-  };
+    1,
+  );
 }
 
 test("classifies abnormal turn endings as continuable", () => {
   assert.equal(continueStatusFromEvents(sessionWithReason({
     kind: "error",
     error: { message: "upstream", code: "UPSTREAM" },
-  }).events).available, true);
-  assert.equal(continueStatusFromEvents(sessionWithReason({ kind: "interrupted" }).events).reason, "interrupted");
-  assert.equal(continueStatusFromEvents(sessionWithReason({ kind: "max-tokens" }).events).reason, "max-tokens");
+  }).snapshotEvents()).available, true);
+  assert.equal(continueStatusFromEvents(sessionWithReason({ kind: "interrupted" }).snapshotEvents()).reason, "interrupted");
+  assert.equal(continueStatusFromEvents(sessionWithReason({ kind: "max-tokens" }).snapshotEvents()).reason, "max-tokens");
   assert.equal(continueStatusFromEvents(sessionWithReason({
     kind: "aborted",
     reason: { kind: "disposed" },
-  }).events).reason, "disposed");
+  }).snapshotEvents()).reason, "disposed");
 });
 
 test("completed and user-aborted turns are not continuable", () => {
-  assert.equal(continueStatusFromEvents(sessionWithReason({ kind: "completed" }).events).available, false);
+  assert.equal(continueStatusFromEvents(sessionWithReason({ kind: "completed" }).snapshotEvents()).available, false);
   assert.equal(continueStatusFromEvents(sessionWithReason({
     kind: "aborted",
     reason: { kind: "user" },
-  }).events).available, false);
+  }).snapshotEvents()).available, false);
 });
 
 test("an open turn is treated as a crash tail", () => {
   const session = Session.create(SessionId("open-turn"));
   session.append("turn/start", { turn: 3 });
-  const status = continueStatusFromEvents(session.events);
+  const status = continueStatusFromEvents(session.snapshotEvents());
   assert.equal(status.available, true);
   assert.equal(status.reason, "interrupted");
   assert.equal(status.turn, 3);
@@ -200,7 +211,7 @@ test("only the latest abnormal continuable subagent can be resumed", async () =>
   const latestId = SessionId("child-latest");
   const parent = fakeAgent({
     id: parentId,
-    session: { header: { id: parentId }, events: [] },
+    session: fakeSession({ id: parentId }, []),
   }).agent;
   const older = fakeAgent({
     id: olderId,
@@ -246,13 +257,13 @@ test("only the latest abnormal continuable subagent can be resumed", async () =>
       { kind: "child", id: olderId, activity: "inactive", hasChildren: false, mode: "continuable", label: "old" },
       { kind: "child", id: latestId, activity: "inactive", hasChildren: false, mode: "continuable", label: "latest" },
     ],
-    followup: async (...args) => {
+    [queueSubagentPrompt]: async (...args) => {
       followupArgs = args;
       latestMessages.push({
         id: "accepted-marker",
         role: "user",
         content: [],
-        source: args[3].source,
+        source: args[3],
       });
       reportFollowup();
       return "accepted-marker";
@@ -290,8 +301,8 @@ test("only the latest abnormal continuable subagent can be resumed", async () =>
   assert.equal(followupArgs[0], parent);
   assert.equal(String(followupArgs[1]), String(latestId));
   assert.deepEqual(followupArgs[2], []);
-  assert.equal(followupArgs[3].source.kind, "user");
-  assert.equal(String(followupArgs[3].source.rpcId).startsWith("dsh-continue:subagent:"), true);
+  assert.equal(followupArgs[3].kind, "user");
+  assert.equal(String(followupArgs[3].rpcId).startsWith("dsh-continue:subagent:"), true);
   await ctx.fiber.dispose();
 });
 
@@ -300,7 +311,7 @@ test("a persisted marker and its recovery marker open exactly one subagent turn"
   const childId = SessionId("recovery-child");
   const parent = fakeAgent({
     id: parentId,
-    session: { header: { id: parentId }, events: [] },
+    session: fakeSession({ id: parentId }, []),
   }).agent;
   const preStepMessages = [subagentWake("persisted")];
   const { agent: child } = fakeAgent({
@@ -340,12 +351,12 @@ test("a persisted marker and its recovery marker open exactly one subagent turn"
     listChildren: async () => [
       { kind: "child", id: childId, activity: "inactive", hasChildren: false, mode: "continuable", label: "recovery" },
     ],
-    followup: async (_parent, _childId, _content, options) => {
+    [queueSubagentPrompt]: async (_parent, _childId, _content, source) => {
       child.inbox.nextTurn.push({
         id: "recovery-marker",
         role: "user",
         content: [],
-        source: options.source,
+        source,
       });
       reportFollowup();
       return "recovery-marker";
@@ -380,7 +391,7 @@ test("a rejected subagent pre-step cancels and removes its exact marker", async 
   const childId = SessionId("reject-child");
   const parent = fakeAgent({
     id: parentId,
-    session: { header: { id: parentId }, events: [] },
+    session: fakeSession({ id: parentId }, []),
   }).agent;
   const { agent: child } = fakeAgent({
     id: childId,
@@ -419,12 +430,12 @@ test("a rejected subagent pre-step cancels and removes its exact marker", async 
     listChildren: async () => [
       { kind: "child", id: childId, activity: "inactive", hasChildren: false, mode: "continuable", label: "reject" },
     ],
-    followup: async (_parent, _childId, _content, options) => {
+    [queueSubagentPrompt]: async (_parent, _childId, _content, source) => {
       child.inbox.nextTurn.push({
         id: "reject-marker",
         role: "user",
         content: [],
-        source: options.source,
+        source,
       });
       reportFollowup();
       return "reject-marker";
@@ -458,7 +469,7 @@ test("an enter decision that already claimed the marker still settles its RPC", 
   const childId = SessionId("claimed-child");
   const parent = fakeAgent({
     id: parentId,
-    session: { header: { id: parentId }, events: [] },
+    session: fakeSession({ id: parentId }, []),
   }).agent;
   const { agent: child } = fakeAgent({
     id: childId,
@@ -497,12 +508,12 @@ test("an enter decision that already claimed the marker still settles its RPC", 
     listChildren: async () => [
       { kind: "child", id: childId, activity: "inactive", hasChildren: false, mode: "continuable", label: "claimed" },
     ],
-    followup: async (_parent, _childId, _content, options) => {
+    [queueSubagentPrompt]: async (_parent, _childId, _content, source) => {
       child.inbox.nextTurn.push({
         id: "claimed-marker",
         role: "user",
         content: [],
-        source: options.source,
+        source,
       });
       reportFollowup();
       return "claimed-marker";
@@ -536,7 +547,7 @@ test("a newer sibling failure cancels the marker at the model-step boundary", as
   const siblingId = SessionId("gate-sibling");
   const parent = fakeAgent({
     id: parentId,
-    session: { header: { id: parentId }, events: [] },
+    session: fakeSession({ id: parentId }, []),
   }).agent;
   const targetMessages = [];
   const target = fakeAgent({
@@ -579,12 +590,12 @@ test("a newer sibling failure cancels the marker at the model-step boundary", as
   ctx.provide("apiProxy", { sessions: {} });
   provideSubagents(ctx, {
     listChildren: async () => entries,
-    followup: async (_parent, _childId, _content, options) => {
+    [queueSubagentPrompt]: async (_parent, _childId, _content, source) => {
       targetMessages.push({
         id: "gate-marker",
         role: "user",
         content: [],
-        source: options.source,
+        source,
       });
       reportFollowup();
       return "gate-marker";
@@ -625,7 +636,7 @@ test("an intervening target turn cancels the queued continuation marker", async 
   const childId = SessionId("intervening-child");
   const parent = fakeAgent({
     id: parentId,
-    session: { header: { id: parentId }, events: [] },
+    session: fakeSession({ id: parentId }, []),
   }).agent;
   const messages = [];
   const child = fakeAgent({
@@ -655,12 +666,12 @@ test("an intervening target turn cancels the queued continuation marker", async 
     listChildren: async () => [
       { kind: "child", id: childId, activity: "inactive", hasChildren: false, mode: "continuable", label: "intervening" },
     ],
-    followup: async (_parent, _childId, _content, options) => {
+    [queueSubagentPrompt]: async (_parent, _childId, _content, source) => {
       messages.push({
         id: "intervening-marker",
         role: "user",
         content: [],
-        source: options.source,
+        source,
       });
       reportFollowup();
       return "intervening-marker";
@@ -698,7 +709,7 @@ test("a busy latest abnormal subagent does not expose an older failure", async (
   const latestId = SessionId("busy-child-latest");
   const parent = fakeAgent({
     id: parentId,
-    session: { header: { id: parentId }, events: [] },
+    session: fakeSession({ id: parentId }, []),
   }).agent;
   const older = fakeAgent({
     id: olderId,
@@ -756,7 +767,7 @@ test("a live subagent without the continuation boundary stays unavailable", asyn
   const childId = SessionId("cold-child");
   const parent = fakeAgent({
     id: parentId,
-    session: { header: { id: parentId }, events: [] },
+    session: fakeSession({ id: parentId }, []),
   }).agent;
   const child = fakeAgent({
     id: childId,
@@ -792,26 +803,21 @@ test("a live subagent without the continuation boundary stays unavailable", asyn
   await ctx.fiber.dispose();
 });
 
-test("official continuable setup installs the boundary before publication", async () => {
-  let setup;
+test("an agent published after apply receives the wake patch before its first step", async () => {
   const ctx = new Context();
   ctx.provide("agents", { list: () => [], get: () => undefined });
   ctx.provide("connection", { rpc: { handle: () => () => {} } });
   ctx.provide("apiProxy", { sessions: {} });
-  provideSubagents(ctx, {
-    registerContinuableSetup: (contribution) => {
-      setup = contribution;
-      return () => {};
-    },
-  });
+  provideSubagents(ctx);
   ctx.provide("logger", { warn: () => {} });
   apply(ctx);
 
-  const { agent } = fakeAgent();
-  const release = setup({ agent });
+  const { agent, originalPreStep } = fakeAgent();
+  ctx.emit("agent/created", { agent });
   assert.equal(startContinuation(agent), true);
   await agent.whenIdle();
-  release();
+  ctx.emit("agent/disposed", { agent });
+  assert.equal(agent.preStep, originalPreStep);
   await ctx.fiber.dispose();
 });
 
@@ -820,16 +826,16 @@ test("ordinary fork sessions remain ordinary continuation targets", async () => 
   const forkId = SessionId("ordinary-fork");
   const fork = fakeAgent({
     id: forkId,
-    session: {
-      header: { id: forkId, parentSession: parentId, seedLength: 0 },
-      events: [
+    session: fakeSession(
+      { id: forkId, parentSession: parentId },
+      [
         event(1, "turn/start", { turn: 1 }),
         event(2, "turn/end", {
           turn: 1,
           reason: { kind: "error", error: { message: "fork", code: "FORK" } },
         }),
       ],
-    },
+    ),
   }).agent;
   let catalogReads = 0;
   const ctx = new Context();
@@ -989,7 +995,7 @@ test("a tracked late marker crosses its recorded blocked turn and resumes", asyn
   const childId = SessionId("late-gate-child");
   const parent = fakeAgent({
     id: parentId,
-    session: { header: { id: parentId }, events: [] },
+    session: fakeSession({ id: parentId }, []),
   }).agent;
   const messages = [];
   const { agent: child } = fakeAgent({
@@ -1056,14 +1062,14 @@ test("a tracked late marker crosses its recorded blocked turn and resumes", asyn
     listChildren: async () => [
       { kind: "child", id: childId, activity: "inactive", hasChildren: false, mode: "continuable", label: "late-gate" },
     ],
-    followup: async (_parent, _childId, _content, options) => {
+    [queueSubagentPrompt]: async (_parent, _childId, _content, source) => {
       reportFollowupEntered();
       await followupGate;
       messages.push({
         id: "late-gate-marker",
         role: "user",
         content: [],
-        source: options.source,
+        source,
       });
       reportFollowupAccepted();
       return "late-gate-marker";
@@ -1108,7 +1114,7 @@ test("ordinary input cancels a deferred tracked marker without waiting", async (
   const childId = SessionId("deferred-ordinary-child");
   const parent = fakeAgent({
     id: parentId,
-    session: { header: { id: parentId }, events: [] },
+    session: fakeSession({ id: parentId }, []),
   }).agent;
   const messages = [];
   const { agent: child } = fakeAgent({
@@ -1174,14 +1180,14 @@ test("ordinary input cancels a deferred tracked marker without waiting", async (
     listChildren: async () => [
       { kind: "child", id: childId, activity: "inactive", hasChildren: false, mode: "continuable", label: "ordinary" },
     ],
-    followup: async (_parent, _childId, _content, options) => {
+    [queueSubagentPrompt]: async (_parent, _childId, _content, source) => {
       reportFollowupEntered();
       await followupGate;
       messages.push({
         id: "deferred-ordinary-marker",
         role: "user",
         content: [],
-        source: options.source,
+        source,
       });
       reportFollowupAccepted();
       return "deferred-ordinary-marker";
@@ -1404,7 +1410,7 @@ test("RPC admission starts the direct continuation without appending a prompt", 
   }, signal);
   assert.deepEqual(result, { ok: true, value: { accepted: true } });
   await agent.preStep("next-turn", { turn: 2, step: 1 });
-  assert.deepEqual(session.events.map((item) => item.type), ["turn/start", "turn/end"]);
+  assert.deepEqual(session.snapshotEvents().map((item) => item.type), ["turn/start", "turn/end"]);
   await agent.whenIdle();
   await ctx.fiber.dispose();
 });
@@ -1448,7 +1454,7 @@ test("a claimed marker remains cancelled while pre-step is still running", async
   const childId = SessionId("claimed-cancel-child");
   const parent = fakeAgent({
     id: parentId,
-    session: { header: { id: parentId }, events: [] },
+    session: fakeSession({ id: parentId }, []),
   }).agent;
   const messages = [];
   const { agent: child } = fakeAgent({
@@ -1492,12 +1498,12 @@ test("a claimed marker remains cancelled while pre-step is still running", async
     listChildren: async () => [
       { kind: "child", id: childId, activity: "inactive", hasChildren: false, mode: "continuable", label: "claimed" },
     ],
-    followup: async (_parent, _childId, _content, options) => {
+    [queueSubagentPrompt]: async (_parent, _childId, _content, source) => {
       messages.push({
         id: "claimed-cancel-marker",
         role: "user",
         content: [],
-        source: options.source,
+        source,
       });
       reportFollowup();
       return "claimed-cancel-marker";
@@ -1581,14 +1587,13 @@ test("shutdown aborts cold persistence before a second read can start", async ()
 
 test("a cold handle published at cancellation is always disposed", async () => {
   const sessionId = SessionId("cold-cancelled-publication");
-  const meta = { id: sessionId, cwd: "C:/workspace", seedLength: 0 };
+  const meta = { id: sessionId, cwd: "C:/workspace" };
   const events = [
     event(0, "turn/start", { turn: 1 }),
     event(1, "turn/end", { turn: 1, reason: { kind: "interrupted" } }),
   ];
   const session = {
-    header: meta,
-    events,
+    ...fakeSession(meta, events),
     requestHeader: () => undefined,
   };
   const { agent } = fakeAgent({ id: sessionId, session });
@@ -1630,7 +1635,7 @@ test("a cold handle published at cancellation is always disposed", async () => {
   });
   ctx.provide("sessionPersistence", {
     list: async () => [meta],
-    inspect: async () => ({ meta, events }),
+    inspect: async () => ({ meta, inheritedEventCount: 0, events }),
   });
   provideSubagents(ctx);
   ctx.provide("logger", { warn: () => {} });
@@ -1666,7 +1671,7 @@ test("a cold handle published at cancellation is always disposed", async () => {
 
 test("cancellation after cold resolution prevents the model wake", async () => {
   const sessionId = SessionId("cold-cancelled-before-wake");
-  const meta = { id: sessionId, cwd: "C:/workspace", seedLength: 0 };
+  const meta = { id: sessionId, cwd: "C:/workspace" };
   const durableEvents = [
     event(0, "turn/start", { turn: 1 }),
     event(1, "turn/end", { turn: 1, reason: { kind: "interrupted" } }),
@@ -1674,13 +1679,16 @@ test("cancellation after cold resolution prevents the model wake", async () => {
   const controller = new AbortController();
   let abortOnRead = false;
   const session = {
-    header: meta,
+    ...fakeSession(meta, []),
     get events() {
       if (abortOnRead) {
         abortOnRead = false;
         controller.abort();
       }
       return durableEvents;
+    },
+    snapshotEvents() {
+      return this.events;
     },
     requestHeader: () => undefined,
   };
@@ -1722,7 +1730,7 @@ test("cancellation after cold resolution prevents the model wake", async () => {
   });
   ctx.provide("sessionPersistence", {
     list: async () => [meta],
-    inspect: async () => ({ meta, events: durableEvents }),
+    inspect: async () => ({ meta, inheritedEventCount: 0, events: durableEvents }),
   });
   provideSubagents(ctx);
   ctx.provide("logger", { warn: () => {} });
@@ -1748,7 +1756,6 @@ test("cold resume restores the recorded preset and logged model selection", asyn
   const meta = {
     id: sessionId,
     cwd: "C:/workspace",
-    seedLength: 0,
     agentPreset: "created-preset",
   };
   const events = [
@@ -1757,8 +1764,7 @@ test("cold resume restores the recorded preset and logged model selection", asyn
     event(2, "turn/end", { turn: 1, reason: { kind: "interrupted" } }),
   ];
   const session = {
-    header: meta,
-    events,
+    ...fakeSession(meta, events),
     requestHeader: () => ({
       config: {
         provider: "logged-provider",
@@ -1857,7 +1863,7 @@ test("cold resume restores the recorded preset and logged model selection", asyn
   });
   ctx.provide("sessionPersistence", {
     list: async () => [meta],
-    inspect: async () => ({ meta, events }),
+    inspect: async () => ({ meta, inheritedEventCount: 0, events }),
   });
   provideSubagents(ctx);
   ctx.provide("logger", { warn: () => {} });
@@ -1884,7 +1890,7 @@ test("cold resume restores the recorded preset and logged model selection", asyn
 test("shutdown rolls back a cold Agent before publication", async () => {
   const sessionId = SessionId("cold-stalled-restoration");
   const session = sessionWithReason({ kind: "interrupted" });
-  const meta = { id: sessionId, cwd: "C:/workspace", seedLength: 0 };
+  const meta = { id: sessionId, cwd: "C:/workspace" };
   let rpcHandler;
   let published = false;
   let releaseResume;
@@ -1937,7 +1943,7 @@ test("shutdown rolls back a cold Agent before publication", async () => {
   });
   ctx.provide("sessionPersistence", {
     list: async () => [meta],
-    inspect: async () => ({ meta, events: session.events }),
+    inspect: async () => ({ meta, inheritedEventCount: 0, events: session.snapshotEvents() }),
   });
   provideSubagents(ctx);
   ctx.provide("logger", { warn: () => {} });
@@ -1969,7 +1975,7 @@ test("shutdown completes while subagent status lookup ignores cancellation", asy
   const childId = SessionId("stalled-status-child");
   const parent = fakeAgent({
     id: parentId,
-    session: { header: { id: parentId }, events: [] },
+    session: fakeSession({ id: parentId }, []),
   }).agent;
   const { agent: child, originalPreStep } = fakeAgent({
     id: childId,
@@ -2053,7 +2059,7 @@ test("RPC shutdown cancels an admitted marker before restoring the Agent boundar
   const childId = SessionId("shutdown-child");
   const parent = fakeAgent({
     id: parentId,
-    session: { header: { id: parentId }, events: [] },
+    session: fakeSession({ id: parentId }, []),
   }).agent;
   const { agent: child, originalPreStep } = fakeAgent({
     id: childId,
@@ -2102,12 +2108,12 @@ test("RPC shutdown cancels an admitted marker before restoring the Agent boundar
     listChildren: async () => [
       { kind: "child", id: childId, activity: "inactive", hasChildren: false, mode: "continuable", label: "shutdown" },
     ],
-    followup: async (_parent, _childId, _content, options) => {
+    [queueSubagentPrompt]: async (_parent, _childId, _content, source) => {
       child.inbox.nextTurn.push({
         id: "shutdown-marker",
         role: "user",
         content: [],
-        source: options.source,
+        source,
       });
       reportFollowup();
       await new Promise(() => {});

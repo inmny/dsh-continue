@@ -7,15 +7,17 @@ import type {
 } from "@deepseek-ai/dsh-agent";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
 import type {} from "@deepseek-ai/dsh-agent-default-model";
-import { resolveSessionPreset } from "@deepseek-ai/dsh-agent-presets";
+import type {} from "@deepseek-ai/dsh-agent-presets";
 import type {} from "@deepseek-ai/dsh-agent/types";
 import type { ConnectionRpcHandler } from "@deepseek-ai/dsh-client-connection";
 import {
   RpcId,
-  type RpcResult,
-} from "@deepseek-ai/dsh-host-apiproxy";
+  type ConnectionRpcResult,
+} from "@deepseek-ai/dsh-client-connection";
 import type {} from "@deepseek-ai/dsh-session-persistence";
+import type { MessageSource } from "@deepseek-ai/dsh-llm";
 import type { SubagentListEntry } from "@deepseek-ai/dsh-subagent";
+import { queueHostSubagentPrompt } from "@deepseek-ai/dsh-subagent/internal";
 import {
   foldRequestHeader,
   SessionId,
@@ -133,7 +135,7 @@ type ContinuableChildEntry = Extract<ChildEntry, { mode: "continuable" }>;
 type SessionState = {
   readonly header: SessionHeader;
   readonly events: readonly SessionEvent[];
-  readonly seedLength: number;
+  readonly inheritedEventCount: number;
   readonly subagent: boolean;
   readonly agent?: Agent;
   readonly parentSessionId?: ReturnType<typeof SessionId>;
@@ -280,7 +282,7 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boo
   return Object.keys(value).every((key) => expected.delete(key)) && expected.size === 0;
 }
 
-function badRequest(message: string): RpcResult<unknown> {
+function badRequest(message: string): ConnectionRpcResult<unknown> {
   return {
     ok: false,
     error: {
@@ -291,7 +293,7 @@ function badRequest(message: string): RpcResult<unknown> {
   };
 }
 
-function busy(message: string): RpcResult<unknown> {
+function busy(message: string): ConnectionRpcResult<unknown> {
   return {
     ok: false,
     error: {
@@ -302,7 +304,7 @@ function busy(message: string): RpcResult<unknown> {
   };
 }
 
-function internal(message: string): RpcResult<unknown> {
+function internal(message: string): ConnectionRpcResult<unknown> {
   return {
     ok: false,
     error: {
@@ -313,7 +315,7 @@ function internal(message: string): RpcResult<unknown> {
   };
 }
 
-function cancelled(): RpcResult<unknown> {
+function cancelled(): ConnectionRpcResult<unknown> {
   return {
     ok: false,
     error: {
@@ -541,9 +543,9 @@ function reasonFromTurnEnd(event: SessionEvent): ContinueReason {
 
 function latestTurnBoundaryEvent(
   events: readonly SessionEvent[],
-  seedLength = 0,
+  inheritedEventCount = 0,
 ): SessionEvent | undefined {
-  const start = Math.max(0, Math.min(seedLength, events.length));
+  const start = Math.max(0, Math.min(inheritedEventCount, events.length));
   for (let index = events.length - 1; index >= start; index -= 1) {
     const event = events[index];
     if (event?.type === "turn/end" || event?.type === "turn/start") return event;
@@ -574,26 +576,26 @@ function statusFromBoundaryEvent(event: SessionEvent): ContinueStatus | undefine
 
 function latestTurnBoundary(
   events: readonly SessionEvent[],
-  seedLength = 0,
+  inheritedEventCount = 0,
 ): ContinueStatus | undefined {
-  const event = latestTurnBoundaryEvent(events, seedLength);
+  const event = latestTurnBoundaryEvent(events, inheritedEventCount);
   return event === undefined ? undefined : statusFromBoundaryEvent(event);
 }
 
 function boundaryTime(
   events: readonly SessionEvent[],
-  seedLength: number,
+  inheritedEventCount: number,
 ): number {
-  return latestTurnBoundaryEvent(events, seedLength)?.time ?? -1;
+  return latestTurnBoundaryEvent(events, inheritedEventCount)?.time ?? -1;
 }
 
 function replayPendingMessages(
   events: readonly SessionEvent[],
-  seedLength: number,
+  inheritedEventCount: number,
 ): UserMessage[] {
   const nextTurn: UserMessage[] = [];
   const nextStep: UserMessage[] = [];
-  const start = Math.max(0, Math.min(seedLength, events.length));
+  const start = Math.max(0, Math.min(inheritedEventCount, events.length));
   for (const event of events.slice(start)) {
     if (event.type !== "agent/inbox/spliced") continue;
     const list = event.data.target === "next-turn" ? nextTurn : nextStep;
@@ -608,25 +610,25 @@ function replayPendingMessages(
 function hasPendingMessages(
   events: readonly SessionEvent[],
   agent: Agent | undefined,
-  seedLength = 0,
+  inheritedEventCount = 0,
 ): boolean {
   if (agent !== undefined) return agent.inbox.hasPending;
-  return replayPendingMessages(events, seedLength).length > 0;
+  return replayPendingMessages(events, inheritedEventCount).length > 0;
 }
 
 /** Classify the latest durable turn and reject sessions with unrelated pending input. */
 export function continueStatusFromEvents(
   events: readonly SessionEvent[],
   agent?: Agent,
-  seedLength = 0,
+  inheritedEventCount = 0,
 ): ContinueStatus {
-  const boundary = latestTurnBoundary(events, seedLength);
+  const boundary = latestTurnBoundary(events, inheritedEventCount);
   if (boundary === undefined) return { available: false, reason: "none" };
   if (!boundary.available) return boundary;
   const internal = agent as InternalAgent | undefined;
   if (agent?.status === "running"
     || (agent !== undefined && internal?.phase?.kind !== "idle")
-    || hasPendingMessages(events, agent, seedLength)) {
+    || hasPendingMessages(events, agent, inheritedEventCount)) {
     return { ...boundary, available: false };
   }
   return boundary;
@@ -930,10 +932,8 @@ function sessionStateFromAgent(agent: Agent): SessionState {
   const parentSessionId = agent.session.header.parentSession;
   return {
     header: agent.session.header,
-    events: agent.session.events,
-    seedLength: typeof agent.session.header.seedLength === "number"
-      ? agent.session.header.seedLength
-      : 0,
+    events: agent.session.snapshotEvents(),
+    inheritedEventCount: agent.session.inheritedEventCount,
     subagent: agent.session.header.origin === "subagent",
     agent,
     ...(parentSessionId === undefined ? {} : { parentSessionId }),
@@ -963,9 +963,7 @@ async function readSessionState(
   return {
     header: inspected.meta,
     events: inspected.events,
-    seedLength: typeof inspected.meta.seedLength === "number"
-      ? inspected.meta.seedLength
-      : 0,
+    inheritedEventCount: inspected.inheritedEventCount,
     subagent: inspected.meta.origin === "subagent",
     ...(inspected.meta.parentSession === undefined
       ? {}
@@ -994,7 +992,7 @@ async function inspectSubagentStatus(
   const parentSessionId = state.parentSessionId;
   if (parentSessionId === undefined) {
     return {
-      ...continueStatusFromEvents(state.events, state.agent, state.seedLength),
+      ...continueStatusFromEvents(state.events, state.agent, state.inheritedEventCount),
       target: "session",
     };
   }
@@ -1026,11 +1024,11 @@ async function inspectSubagentStatus(
     const candidateStatus = continueStatusFromEvents(
       candidateState.events,
       candidateState.agent,
-      candidateState.seedLength,
+      candidateState.inheritedEventCount,
     );
     const candidateBoundary = latestTurnBoundary(
       candidateState.events,
-      candidateState.seedLength,
+      candidateState.inheritedEventCount,
     );
     if (entry.id === sessionId) {
       targetStatus = candidateState.agent !== undefined
@@ -1039,7 +1037,7 @@ async function inspectSubagentStatus(
         : candidateStatus;
     }
     if (candidateBoundary?.available !== true) continue;
-    const eventTime = boundaryTime(candidateState.events, candidateState.seedLength);
+    const eventTime = boundaryTime(candidateState.events, candidateState.inheritedEventCount);
     if (selected === undefined
       || eventTime > selected.eventTime
       || (eventTime === selected.eventTime && order > selected.order)) {
@@ -1069,9 +1067,23 @@ async function inspectStatus(
     return inspectSubagentStatus(ctx, sessionId, state, signal);
   }
   return {
-    ...continueStatusFromEvents(state.events, state.agent, state.seedLength),
+    ...continueStatusFromEvents(state.events, state.agent, state.inheritedEventCount),
     target: "session",
   };
+}
+
+// The preset a session actually runs: the newest `agent-preset/selected`
+// event wins, otherwise the creation header's value — the same fold the
+// `agentPreset` session projection in dsh-agent-presets performs.
+function resolveSessionAgentPreset(
+  header: SessionHeader,
+  events: readonly SessionEvent[],
+): string | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.type === "agent-preset/selected") return event.data.agentPreset;
+  }
+  return header.agentPreset;
 }
 
 async function resolveLiveAgent(
@@ -1079,17 +1091,14 @@ async function resolveLiveAgent(
   runtime: ContinueRuntimeState,
   sessionId: ReturnType<typeof SessionId>,
   signal: AbortSignal,
-): Promise<LiveAgentResolution | RpcResult<unknown>> {
+): Promise<LiveAgentResolution | ConnectionRpcResult<unknown>> {
   const existing = ctx.agents.get(sessionId);
   if (existing !== undefined) return { agent: existing };
   if (signal.aborted) return cancelled();
 
   const state = await readSessionState(ctx, sessionId, signal);
   if (state === undefined) return internal("找不到可恢复的会话。");
-  const presetId = resolveSessionPreset({
-    header: state.header,
-    events: state.events,
-  });
+  const presetId = resolveSessionAgentPreset(state.header, state.events);
   const defaultSelection = ctx.agentDefaultModel.currentSelection();
   const loggedSelection = foldRequestHeader(state.events)?.config;
   const initialSelection: ModelSelection = loggedSelection === undefined
@@ -1227,7 +1236,7 @@ function boundaryStillMatches(
 
 function expectedBoundaryEvent(
   events: readonly SessionEvent[],
-  seedLength: number,
+  inheritedEventCount: number,
   expected: ContinueStatus,
   deferredTurns = 0,
 ): SessionEvent | undefined {
@@ -1237,7 +1246,7 @@ function expectedBoundaryEvent(
     || expected.boundarySeq === undefined) {
     return undefined;
   }
-  const start = Math.max(0, Math.min(seedLength, events.length));
+  const start = Math.max(0, Math.min(inheritedEventCount, events.length));
   const boundaries = events.slice(start).filter(
     (event) => event.type === "turn/start" || event.type === "turn/end",
   );
@@ -1313,8 +1322,8 @@ async function validateSubagentMarker(
     const state = await readSessionState(ctx, entry.id, signal);
     if (state === undefined) continue;
     const event = entry.id === sessionId
-      ? expectedBoundaryEvent(state.events, state.seedLength, expected, deferredTurns)
-      : latestTurnBoundaryEvent(state.events, state.seedLength);
+      ? expectedBoundaryEvent(state.events, state.inheritedEventCount, expected, deferredTurns)
+      : latestTurnBoundaryEvent(state.events, state.inheritedEventCount);
     if (event === undefined) {
       if (entry.id === sessionId) return false;
       continue;
@@ -1338,7 +1347,7 @@ async function resumeSubagent(
   advertised: ResolvedContinueStatus,
   request: ResumeRequest,
   signal: AbortSignal,
-): Promise<RpcResult<unknown>> {
+): Promise<ConnectionRpcResult<unknown>> {
   if (advertised.target !== "subagent") return busy("当前目标不是 subagent 会话。");
   const current = await inspectStatus(ctx, sessionId, signal);
   if (!current.available
@@ -1357,9 +1366,9 @@ async function resumeSubagent(
       return busy("当前 DSH 版本不支持无消息续跑。");
     }
     const liveStatus = continueStatusFromEvents(
-      child.session.events,
+      child.session.snapshotEvents(),
       child,
-      typeof child.session.header.seedLength === "number" ? child.session.header.seedLength : 0,
+      child.session.inheritedEventCount,
     );
     if (!liveStatus.available || !boundaryStillMatches(advertised, liveStatus, request)) {
       return busy("subagent 状态已经变化，请重新读取后再试。");
@@ -1386,13 +1395,10 @@ async function resumeSubagent(
   let admittedChild = child;
   try {
     await awaitWithSignal(
-      ctx.subagents.followup(parent, sessionId, [], {
-        source: {
-          kind: "user",
-          rpcId: wakeSourceId,
-        },
-        signal,
-      }),
+      queueHostSubagentPrompt(ctx.subagents, parent, sessionId, [], {
+        kind: "user",
+        rpcId: wakeSourceId,
+      } as MessageSource, signal),
       signal,
     );
     admitted = true;
@@ -1487,7 +1493,7 @@ export function createContinueRpcHandler(ctx: Context): ConnectionRpcHandler {
 
       const resolved = await resolveLiveAgent(ctx, runtime, sessionId, signal);
       if (isRecord(resolved) && "ok" in resolved) {
-        return resolved as RpcResult<unknown>;
+        return resolved as ConnectionRpcResult<unknown>;
       }
       const resolution = resolved as LiveAgentResolution;
       const liveAgent = resolution.agent;
@@ -1500,9 +1506,9 @@ export function createContinueRpcHandler(ctx: Context): ConnectionRpcHandler {
         }
       };
       const current = continueStatusFromEvents(
-        liveAgent.session.events,
+        liveAgent.session.snapshotEvents(),
         liveAgent,
-        typeof liveAgent.session.header.seedLength === "number" ? liveAgent.session.header.seedLength : 0,
+        liveAgent.session.inheritedEventCount,
       );
       if (!current.available || !boundaryStillMatches(advertised, current, request)) {
         await disposeColdAgent();
@@ -1594,30 +1600,9 @@ export function apply(ctx: Context): void {
     releasePatch(agent, state);
   };
 
-  const subagents = ctx.get("subagents");
-  if (subagents !== undefined) {
-    ctx.effect(
-      () => subagents.registerContinuableSetup((childCtx) => {
-        if (runtime.shuttingDown) {
-          throw new Error("dsh-continue: child setup is shutting down");
-        }
-        const agent = (childCtx as Context & { readonly agent?: Agent }).agent;
-        if (agent === undefined) return () => {};
-        const state = installAgentPatch(agent, ctx, runtime.markers);
-        if (state === undefined) {
-          throw new Error("dsh-continue: continuable child lacks an empty-wake boundary");
-        }
-        patches.set(agent, state);
-        return () => {
-          if (patches.get(agent) !== state) return;
-          patches.delete(agent);
-          releasePatch(agent, state);
-        };
-      }),
-      "dsh-continue: continuable child setup",
-    );
-  }
-
+  // `agent/created` fires synchronously during publication, before an Agent's
+  // loop can take a step, so it also covers continuable children created or
+  // cold-resumed by the subagent service.
   for (const agent of ctx.agents.list()) install({ agent });
   ctx.on("agent/created", install);
   ctx.on("agent/status", ({ agent, status }) => {
@@ -1631,7 +1616,6 @@ export function apply(ctx: Context): void {
     const disposeRpc = ctx.connection.rpc.handle(
       RPC_CHANNEL,
       createContinueRpcHandler(ctx),
-      { authority: "loopback" },
     );
     return async () => {
       beginShutdown(runtime);
