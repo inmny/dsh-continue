@@ -14,7 +14,10 @@ import {
   RpcId,
   type ConnectionRpcResult,
 } from "@deepseek-ai/dsh-client-connection";
+import type {} from "@deepseek-ai/dsh-host-webserver";
 import type {} from "@deepseek-ai/dsh-session-persistence";
+import type { SessionHandle } from "@deepseek-ai/dsh-session-persistence";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import type { MessageSource } from "@deepseek-ai/dsh-llm";
 import type { SubagentListEntry } from "@deepseek-ai/dsh-subagent";
 import { queueHostSubagentPrompt } from "@deepseek-ai/dsh-subagent/internal";
@@ -35,6 +38,9 @@ export const inject = [
   "connection",
   "sessionPersistence",
   "subagents",
+  // `connection.rpc.handle` registers its route on the caller's webServer
+  // service since dsh 0.1.5.
+  "webServer",
 ];
 export const RPC_CHANNEL = "/dsh-continue";
 
@@ -612,8 +618,16 @@ function hasPendingMessages(
   agent: Agent | undefined,
   inheritedEventCount = 0,
 ): boolean {
-  if (agent !== undefined) return agent.inbox.hasPending;
+  if (agent !== undefined) return inboxHasPending(agent);
   return replayPendingMessages(events, inheritedEventCount).length > 0;
+}
+
+// Wake markers are the plugin's own control-plane messages: only ordinary
+// input counts as pending, matching the boundary logic in the preStep patch.
+function inboxHasPending(agent: Agent): boolean {
+  return [...agent.inbox.nextStep, ...agent.inbox.nextTurn].some(
+    (message) => !isContinuationWakeMessage(message),
+  );
 }
 
 /** Classify the latest durable turn and reject sessions with unrelated pending input. */
@@ -893,7 +907,7 @@ export function startContinuation(agent: Agent): boolean {
     || typeof internal.wakeDriver !== "function"
     || internal.phase?.kind !== "idle"
     || agent.status !== "idle"
-    || agent.inbox.hasPending
+    || inboxHasPending(agent)
     || state.pending
     || state.active
     || state.disposeRequested) {
@@ -954,21 +968,32 @@ async function readSessionState(
   if (persistence === undefined) {
     throw new Error("session persistence is not configured");
   }
-  const meta = (await awaitWithSignal(persistence.list(signal), signal))
-    .find((candidate) => candidate.id === sessionId);
-  if (meta === undefined || meta.cwd === undefined) return undefined;
-  signal.throwIfAborted();
-  const inspected = await awaitWithSignal(persistence.inspect(sessionId, signal), signal);
-  if (inspected.meta.cwd === undefined) return undefined;
-  return {
-    header: inspected.meta,
-    events: inspected.events,
-    inheritedEventCount: inspected.inheritedEventCount,
-    subagent: inspected.meta.origin === "subagent",
-    ...(inspected.meta.parentSession === undefined
-      ? {}
-      : { parentSessionId: inspected.meta.parentSession }),
-  };
+  const snapshot = await awaitWithSignal(persistence.stat(sessionId, { signal }), signal);
+  if (snapshot === undefined || snapshot.header.cwd === undefined) return undefined;
+  let handle: SessionHandle;
+  try {
+    handle = await awaitWithSignal(persistence.open(sessionId, "read", { signal }), signal);
+  } catch (error) {
+    // The failure carries no cross-module-copy-safe brand; a matching session
+    // id means the stored log vanished between stat and open.
+    if (isRecord(error) && error.sessionId === sessionId) return undefined;
+    throw error;
+  }
+  try {
+    if (handle.header.cwd === undefined) return undefined;
+    const { events } = await awaitWithSignal(handle.read(0, undefined, { signal }), signal);
+    return {
+      header: handle.header,
+      events,
+      inheritedEventCount: handle.inheritedEventCount,
+      subagent: handle.header.origin === "subagent",
+      ...(handle.header.parentSession === undefined
+        ? {}
+        : { parentSessionId: handle.header.parentSession }),
+    };
+  } finally {
+    await handle.close();
+  }
 }
 
 function unavailableSubagentStatus(
@@ -1611,16 +1636,142 @@ export function apply(ctx: Context): void {
   ctx.on("agent/disposed", release);
 
   // Registered last so shutdown first closes admission, settles every entered
-  // request, and only then lets Cordis dispose setup hooks and Agent patches.
+  // request, and only then lets Cordis dispose the web route and Agent patches.
   ctx.effect(() => {
-    const disposeRpc = ctx.connection.rpc.handle(
-      RPC_CHANNEL,
-      createContinueRpcHandler(ctx),
-    );
+    const connection = ctx.connection;
+    const handler = createContinueRpcHandler(ctx);
+    const disposeRoute = ctx.webServer.register({
+      kind: "prefix",
+      path: RPC_CHANNEL,
+      handler: (req, res) => {
+        void serveChannelRpc(connection, handler, req, res);
+      },
+    });
     return async () => {
       beginShutdown(runtime);
-      await disposeRpc();
+      disposeRoute();
       await Promise.allSettled([...runtime.activeRequests]);
     };
-  }, "dsh-continue: RPC channel");
+  }, "dsh-continue: web route");
+}
+
+// --- /dsh-continue web transport --------------------------------------------
+// dsh 0.1.5 registers web routes on the webServer service; the connection
+// service contributes the trust/auth fence. The wire envelope mirrors the
+// shared transport: a `client-request` JSON object in, a `server-response`
+// JSON object carrying the ConnectionRpcResult out.
+
+const ENDPOINT_SEGMENT_PATTERN = /^[A-Za-z0-9_$.-]+$/;
+const MAX_REQUEST_BODY_BYTES = 300 * 1024 * 1024;
+
+function channelEndpoint(pathname: string): string | undefined {
+  if (!pathname.startsWith(`${RPC_CHANNEL}/`)) return undefined;
+  const endpoint = pathname.slice(RPC_CHANNEL.length + 1);
+  if (endpoint.split("/").some((segment) => segment === "" || segment === "." || segment === ".."
+    || !ENDPOINT_SEGMENT_PATTERN.test(segment))) {
+    return undefined;
+  }
+  return endpoint;
+}
+
+function rpcResponse(rpcId: string, result: ConnectionRpcResult<unknown>): string {
+  return JSON.stringify({ type: "server-response", rpcId, result });
+}
+
+function invalidRequestResponse(body: unknown): string {
+  const rpcId = isRecord(body) && typeof body.rpcId === "string" ? body.rpcId : "invalid-request";
+  return rpcResponse(rpcId, {
+    ok: false,
+    error: { code: "gateway/bad-request", message: "invalid client-request message", details: {} },
+  });
+}
+
+function writeJson(res: ServerResponse, body: string): void {
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(body);
+}
+
+async function readRequestBody(req: IncomingMessage, signal: AbortSignal): Promise<string | undefined> {
+  const declared = req.headers["content-length"];
+  if (declared !== undefined && Number(declared) > MAX_REQUEST_BODY_BYTES) return undefined;
+  const chunks: Buffer[] = [];
+  let received = 0;
+  for await (const chunk of req) {
+    if (signal.aborted) return undefined;
+    chunks.push(chunk as Buffer);
+    received += (chunk as Buffer).byteLength;
+    if (received > MAX_REQUEST_BODY_BYTES) return undefined;
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function serveChannelRpc(
+  connection: Context["connection"],
+  handler: ConnectionRpcHandler,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  const rejection = connection.requestRejection({ headers: req.headers });
+  if (rejection !== undefined) {
+    res.writeHead(rejection);
+    res.end(rejection === 401 ? "unauthorized" : "forbidden");
+    return;
+  }
+  const abort = new AbortController();
+  res.on("close", () => {
+    if (!res.writableEnded) abort.abort();
+  });
+  const url = new URL(req.url ?? "/", "http://dsh.internal");
+  const endpoint = channelEndpoint(url.pathname);
+  if (req.method !== "POST" || endpoint === undefined) {
+    res.writeHead(404);
+    res.end("not found");
+    return;
+  }
+  if (req.headers["content-type"]?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json") {
+    res.writeHead(415);
+    res.end("content type must be application/json");
+    return;
+  }
+  const bodyText = await readRequestBody(req, abort.signal);
+  if (bodyText === undefined || abort.signal.aborted) return;
+  let body: unknown;
+  try {
+    body = JSON.parse(bodyText);
+  } catch {
+    res.writeHead(400);
+    res.end("body is not JSON");
+    return;
+  }
+  const message = isRecord(body)
+    && body.type === "client-request"
+    && typeof body.rpcId === "string"
+    && typeof body.method === "string"
+    && "payload" in body
+    ? body as { readonly type: "client-request"; readonly rpcId: string; readonly method: string; readonly payload: unknown }
+    : undefined;
+  if (message === undefined) {
+    writeJson(res, invalidRequestResponse(body));
+    return;
+  }
+  if (message.method !== endpoint) {
+    writeJson(res, rpcResponse(message.rpcId, {
+      ok: false,
+      error: {
+        code: "gateway/bad-request",
+        message: `method ${JSON.stringify(message.method)} does not match endpoint ${JSON.stringify(endpoint)}`,
+        details: {},
+      },
+    }));
+    return;
+  }
+  let result: ConnectionRpcResult<unknown>;
+  try {
+    result = await handler(endpoint, message.payload, abort.signal);
+  } catch (error) {
+    res.writeHead(500);
+    res.end(`handler failure: ${String(error)}`);
+    return;
+  }
+  writeJson(res, rpcResponse(message.rpcId, result));
 }

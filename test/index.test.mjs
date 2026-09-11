@@ -8,7 +8,7 @@ import {
   startContinuation,
 } from "../lib/index.js";
 import { Context } from "@deepseek-ai/cordis";
-import { queueSubagentPrompt } from "@deepseek-ai/dsh-subagent/internal";
+import { deliverSubagentPrompt } from "@deepseek-ai/dsh-subagent/internal";
 import { Session, SessionId } from "@deepseek-ai/dsh-session";
 
 function sessionWithReason(reason) {
@@ -30,9 +30,15 @@ function fakeAgent({
   let idlePromise = Promise.resolve();
   const originalPreStep = async () => ({ kind: "enter", messages: [...preStepMessages] });
   const inbox = {
-    hasPending: pending,
     nextStep: [],
-    nextTurn: preStepMessages,
+    nextTurn: pending
+      ? [{
+        id: "queued-input",
+        role: "user",
+        content: [{ type: "text", text: "queued" }],
+        source: { kind: "user" },
+      }, ...preStepMessages]
+      : preStepMessages,
     remove(id) {
       for (const list of [inbox.nextStep, inbox.nextTurn]) {
         const index = list.findIndex((message) => message.id === id);
@@ -110,10 +116,23 @@ function fakeSession(header, events, inheritedEventCount = 0) {
   };
 }
 
+function fakeStoredSession(meta, events, inheritedEventCount = 0) {
+  return {
+    id: meta.id,
+    header: meta,
+    inheritedEventCount,
+    access: "read",
+    async read() {
+      return { eventState: "shared", events };
+    },
+    async close() {},
+  };
+}
+
 function provideSubagents(ctx, overrides = {}) {
   ctx.provide("subagents", {
     listChildren: async () => [],
-    [queueSubagentPrompt]: async () => "subagent-message",
+    [deliverSubagentPrompt]: async () => "subagent-message",
     ...overrides,
   });
 }
@@ -246,6 +265,7 @@ test("only the latest abnormal continuable subagent can be resumed", async () =>
     reportFollowup = resolve;
   });
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", {
     list: () => [parent, older, latest],
     get: (id) => agents.get(String(id)),
@@ -257,7 +277,7 @@ test("only the latest abnormal continuable subagent can be resumed", async () =>
       { kind: "child", id: olderId, activity: "inactive", hasChildren: false, mode: "continuable", label: "old" },
       { kind: "child", id: latestId, activity: "inactive", hasChildren: false, mode: "continuable", label: "latest" },
     ],
-    [queueSubagentPrompt]: async (...args) => {
+    [deliverSubagentPrompt]: async (...args) => {
       followupArgs = args;
       latestMessages.push({
         id: "accepted-marker",
@@ -341,6 +361,7 @@ test("a persisted marker and its recovery marker open exactly one subagent turn"
     reportFollowup = resolve;
   });
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", {
     list: () => [parent, child],
     get: (id) => agents.get(String(id)),
@@ -351,7 +372,7 @@ test("a persisted marker and its recovery marker open exactly one subagent turn"
     listChildren: async () => [
       { kind: "child", id: childId, activity: "inactive", hasChildren: false, mode: "continuable", label: "recovery" },
     ],
-    [queueSubagentPrompt]: async (_parent, _childId, _content, source) => {
+    [deliverSubagentPrompt]: async (_parent, _childId, _content, source) => {
       child.inbox.nextTurn.push({
         id: "recovery-marker",
         role: "user",
@@ -420,6 +441,7 @@ test("a rejected subagent pre-step cancels and removes its exact marker", async 
     reportFollowup = resolve;
   });
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", {
     list: () => [parent, child],
     get: (id) => agents.get(String(id)),
@@ -430,7 +452,7 @@ test("a rejected subagent pre-step cancels and removes its exact marker", async 
     listChildren: async () => [
       { kind: "child", id: childId, activity: "inactive", hasChildren: false, mode: "continuable", label: "reject" },
     ],
-    [queueSubagentPrompt]: async (_parent, _childId, _content, source) => {
+    [deliverSubagentPrompt]: async (_parent, _childId, _content, source) => {
       child.inbox.nextTurn.push({
         id: "reject-marker",
         role: "user",
@@ -498,6 +520,7 @@ test("an enter decision that already claimed the marker still settles its RPC", 
     reportFollowup = resolve;
   });
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", {
     list: () => [parent, child],
     get: (id) => agents.get(String(id)),
@@ -508,7 +531,7 @@ test("an enter decision that already claimed the marker still settles its RPC", 
     listChildren: async () => [
       { kind: "child", id: childId, activity: "inactive", hasChildren: false, mode: "continuable", label: "claimed" },
     ],
-    [queueSubagentPrompt]: async (_parent, _childId, _content, source) => {
+    [deliverSubagentPrompt]: async (_parent, _childId, _content, source) => {
       child.inbox.nextTurn.push({
         id: "claimed-marker",
         role: "user",
@@ -582,6 +605,7 @@ test("a newer sibling failure cancels the marker at the model-step boundary", as
     { kind: "child", id: siblingId, activity: "inactive", hasChildren: false, mode: "continuable", label: "sibling" },
   ];
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", {
     list: () => [parent, target, sibling],
     get: (id) => agents.get(String(id)),
@@ -590,7 +614,7 @@ test("a newer sibling failure cancels the marker at the model-step boundary", as
   ctx.provide("apiProxy", { sessions: {} });
   provideSubagents(ctx, {
     listChildren: async () => entries,
-    [queueSubagentPrompt]: async (_parent, _childId, _content, source) => {
+    [deliverSubagentPrompt]: async (_parent, _childId, _content, source) => {
       targetMessages.push({
         id: "gate-marker",
         role: "user",
@@ -656,6 +680,7 @@ test("an intervening target turn cancels the queued continuation marker", async 
     reportFollowup = resolve;
   });
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", {
     list: () => [parent, child],
     get: (id) => agents.get(String(id)),
@@ -666,7 +691,7 @@ test("an intervening target turn cancels the queued continuation marker", async 
     listChildren: async () => [
       { kind: "child", id: childId, activity: "inactive", hasChildren: false, mode: "continuable", label: "intervening" },
     ],
-    [queueSubagentPrompt]: async (_parent, _childId, _content, source) => {
+    [deliverSubagentPrompt]: async (_parent, _childId, _content, source) => {
       messages.push({
         id: "intervening-marker",
         role: "user",
@@ -735,6 +760,7 @@ test("a busy latest abnormal subagent does not expose an older failure", async (
     [String(latestId), latest],
   ]);
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", {
     list: () => [parent, older, latest],
     get: (id) => agents.get(String(id)),
@@ -777,6 +803,7 @@ test("a live subagent without the continuation boundary stays unavailable", asyn
     ]),
   }).agent;
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", {
     list: () => [parent, child],
     get: (id) => String(id) === String(parentId)
@@ -805,6 +832,7 @@ test("a live subagent without the continuation boundary stays unavailable", asyn
 
 test("an agent published after apply receives the wake patch before its first step", async () => {
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", { list: () => [], get: () => undefined });
   ctx.provide("connection", { rpc: { handle: () => () => {} } });
   ctx.provide("apiProxy", { sessions: {} });
@@ -839,6 +867,7 @@ test("ordinary fork sessions remain ordinary continuation targets", async () => 
   }).agent;
   let catalogReads = 0;
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", {
     list: () => [fork],
     get: (id) => String(id) === String(forkId) ? fork : undefined,
@@ -869,6 +898,7 @@ test("ordinary fork sessions remain ordinary continuation targets", async () => 
 test("empty continuation enters a model step without iterating a user message", async () => {
   const { agent, originalPreStep } = fakeAgent();
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", {
     list: () => [agent],
     get: () => agent,
@@ -896,6 +926,7 @@ test("a legacy session marker cannot become a visible user message", async () =>
   const messages = [];
   const { agent } = fakeAgent({ preStepMessages: messages });
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", { list: () => [agent], get: () => agent });
   ctx.provide("connection", { rpc: { handle: () => () => {} } });
   ctx.provide("apiProxy", { sessions: {} });
@@ -927,6 +958,7 @@ test("marker identity remains hidden when another pre-step contribution rewrites
     return before !== agent.inbox.nextTurn.length;
   };
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", { list: () => [agent], get: () => agent });
   ctx.provide("connection", { rpc: { handle: () => () => {} } });
   ctx.provide("apiProxy", { sessions: {} });
@@ -966,6 +998,7 @@ test("a marker arriving after the pre-step snapshot is deferred to the next turn
     return { kind: "enter", messages: [marker] };
   };
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", { list: () => [agent], get: () => agent });
   ctx.provide("connection", { rpc: { handle: () => () => {} } });
   provideSubagents(ctx);
@@ -1053,6 +1086,7 @@ test("a tracked late marker crosses its recorded blocked turn and resumes", asyn
     reportFollowupAccepted = resolve;
   });
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", {
     list: () => [parent, child],
     get: (id) => agents.get(String(id)),
@@ -1062,7 +1096,7 @@ test("a tracked late marker crosses its recorded blocked turn and resumes", asyn
     listChildren: async () => [
       { kind: "child", id: childId, activity: "inactive", hasChildren: false, mode: "continuable", label: "late-gate" },
     ],
-    [queueSubagentPrompt]: async (_parent, _childId, _content, source) => {
+    [deliverSubagentPrompt]: async (_parent, _childId, _content, source) => {
       reportFollowupEntered();
       await followupGate;
       messages.push({
@@ -1171,6 +1205,7 @@ test("ordinary input cancels a deferred tracked marker without waiting", async (
     reportFollowupAccepted = resolve;
   });
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", {
     list: () => [parent, child],
     get: (id) => agents.get(String(id)),
@@ -1180,7 +1215,7 @@ test("ordinary input cancels a deferred tracked marker without waiting", async (
     listChildren: async () => [
       { kind: "child", id: childId, activity: "inactive", hasChildren: false, mode: "continuable", label: "ordinary" },
     ],
-    [queueSubagentPrompt]: async (_parent, _childId, _content, source) => {
+    [deliverSubagentPrompt]: async (_parent, _childId, _content, source) => {
       reportFollowupEntered();
       await followupGate;
       messages.push({
@@ -1258,6 +1293,7 @@ test("plugin shutdown discards a late marker already claimed by pre-step", async
   };
   agent.preStep = delayedPreStep;
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", { list: () => [agent], get: () => agent });
   ctx.provide("connection", { rpc: { handle: () => () => {} } });
   provideSubagents(ctx);
@@ -1288,6 +1324,7 @@ test("subagent continuation markers do not become visible user messages", async 
   };
   const { agent } = fakeAgent({ preStepMessages: [subagentWake(), ordinary] });
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", { list: () => [agent], get: () => agent });
   ctx.provide("connection", { rpc: { handle: () => () => {} } });
   ctx.provide("apiProxy", { sessions: {} });
@@ -1304,6 +1341,7 @@ test("subagent continuation markers do not become visible user messages", async 
 test("empty subagent marker still enters a model step", async () => {
   const { agent } = fakeAgent({ preStepMessages: [subagentWake()] });
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", { list: () => [agent], get: () => agent });
   ctx.provide("connection", { rpc: { handle: () => () => {} } });
   ctx.provide("apiProxy", { sessions: {} });
@@ -1333,6 +1371,7 @@ test("persisted and newly admitted subagent markers collapse into one model step
     return true;
   };
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", { list: () => [agent], get: () => agent });
   ctx.provide("connection", { rpc: { handle: () => () => {} } });
   ctx.provide("apiProxy", { sessions: {} });
@@ -1363,6 +1402,7 @@ test("a throwing pre-step removes queued subagent markers before rethrowing", as
     return true;
   };
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", { list: () => [agent], get: () => agent });
   ctx.provide("connection", { rpc: { handle: () => () => {} } });
   ctx.provide("apiProxy", { sessions: {} });
@@ -1386,6 +1426,7 @@ test("RPC admission starts the direct continuation without appending a prompt", 
   });
   const { agent } = fakeAgent({ session });
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", {
     list: () => [agent],
     get: () => agent,
@@ -1419,6 +1460,7 @@ test("continuation admission rejects maintenance and queued agents", async () =>
   const queued = fakeAgent({ pending: true });
   const maintenance = fakeAgent({ phaseKind: "maintenance" });
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", {
     list: () => [queued.agent, maintenance.agent],
     get: () => undefined,
@@ -1435,6 +1477,7 @@ test("continuation admission rejects maintenance and queued agents", async () =>
 test("a wake cancelled before pre-step releases its continuation state", async () => {
   const { agent } = fakeAgent();
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", { list: () => [agent], get: () => agent });
   ctx.provide("connection", { rpc: { handle: () => () => {} } });
   ctx.provide("apiProxy", { sessions: {} });
@@ -1489,6 +1532,7 @@ test("a claimed marker remains cancelled while pre-step is still running", async
     reportFollowup = resolve;
   });
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", {
     list: () => [parent, child],
     get: (id) => agents.get(String(id)),
@@ -1498,7 +1542,7 @@ test("a claimed marker remains cancelled while pre-step is still running", async
     listChildren: async () => [
       { kind: "child", id: childId, activity: "inactive", hasChildren: false, mode: "continuable", label: "claimed" },
     ],
-    [queueSubagentPrompt]: async (_parent, _childId, _content, source) => {
+    [deliverSubagentPrompt]: async (_parent, _childId, _content, source) => {
       messages.push({
         id: "claimed-cancel-marker",
         role: "user",
@@ -1535,54 +1579,42 @@ test("a claimed marker remains cancelled while pre-step is still running", async
 });
 
 test("shutdown aborts cold persistence before a second read can start", async () => {
-  let rpcHandler;
-  let inspectCalls = 0;
-  let reportList;
-  const listStarted = new Promise((resolve) => {
-    reportList = resolve;
+  let openCalls = 0;
+  let reportOpen;
+  const openStarted = new Promise((resolve) => {
+    reportOpen = resolve;
   });
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", { list: () => [], get: () => undefined });
-  ctx.provide("connection", {
-    rpc: {
-      handle: (_channel, handler) => {
-        rpcHandler = handler;
-        return async () => {};
-      },
-    },
-  });
+  ctx.provide("connection", { requestRejection: () => undefined });
   ctx.provide("apiProxy", { sessions: {} });
   ctx.provide("sessionPersistence", {
-    list: async (signal) => {
-      reportList();
-      return new Promise((resolve) => {
-        const finish = () => resolve([{ id: SessionId("cold-stalled-session"), cwd: "C:/workspace" }]);
-        if (signal.aborted) finish();
-        else signal.addEventListener("abort", finish, { once: true });
-      });
-    },
-    inspect: async () => {
-      inspectCalls += 1;
-      throw new Error("inspect must not start after shutdown");
+    stat: async () => ({ header: { id: SessionId("cold-stalled-session"), cwd: "C:/workspace" }, revision: 0 }),
+    open: async () => {
+      openCalls += 1;
+      reportOpen();
+      return new Promise(() => {});
     },
   });
   provideSubagents(ctx);
   ctx.provide("logger", { warn: () => {} });
   apply(ctx);
+  const rpcHandler = createContinueRpcHandler(ctx);
 
   const status = rpcHandler(
     "status",
     { sessionId: "cold-stalled-session" },
     new AbortController().signal,
   );
-  await listStarted;
+  await openStarted;
   const disposal = ctx.fiber.dispose();
   const result = await status;
   await disposal;
 
   assert.equal(result.ok, false);
   assert.equal(result.error.code, "cancelled");
-  assert.equal(inspectCalls, 0);
+  assert.equal(openCalls, 1);
 });
 
 test("a cold handle published at cancellation is always disposed", async () => {
@@ -1611,8 +1643,8 @@ test("a cold handle published at cancellation is always disposed", async () => {
     reportDisposed = resolve;
   });
   let disposeCalls = 0;
-  let rpcHandler;
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agentDefaultModel", {
     currentSelection: () => ({ provider: "default-provider", model: "default-model" }),
   });
@@ -1625,21 +1657,15 @@ test("a cold handle published at cancellation is always disposed", async () => {
       return resumeHandle;
     },
   });
-  ctx.provide("connection", {
-    rpc: {
-      handle: (_channel, handler) => {
-        rpcHandler = handler;
-        return async () => {};
-      },
-    },
-  });
+  ctx.provide("connection", { requestRejection: () => undefined });
   ctx.provide("sessionPersistence", {
-    list: async () => [meta],
-    inspect: async () => ({ meta, inheritedEventCount: 0, events }),
+    stat: async () => ({ header: meta, revision: 0 }),
+    open: async () => fakeStoredSession(meta, events),
   });
   provideSubagents(ctx);
   ctx.provide("logger", { warn: () => {} });
   apply(ctx);
+  const rpcHandler = createContinueRpcHandler(ctx);
 
   const controller = new AbortController();
   const status = await rpcHandler("status", { sessionId: String(sessionId) }, controller.signal);
@@ -1699,8 +1725,8 @@ test("cancellation after cold resolution prevents the model wake", async () => {
   };
   let live = false;
   let disposeCalls = 0;
-  let rpcHandler;
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agentDefaultModel", {
     currentSelection: () => ({ provider: "default-provider", model: "default-model" }),
   });
@@ -1720,21 +1746,15 @@ test("cancellation after cold resolution prevents the model wake", async () => {
       };
     },
   });
-  ctx.provide("connection", {
-    rpc: {
-      handle: (_channel, handler) => {
-        rpcHandler = handler;
-        return async () => {};
-      },
-    },
-  });
+  ctx.provide("connection", { requestRejection: () => undefined });
   ctx.provide("sessionPersistence", {
-    list: async () => [meta],
-    inspect: async () => ({ meta, inheritedEventCount: 0, events: durableEvents }),
+    stat: async () => ({ header: meta, revision: 0 }),
+    open: async () => fakeStoredSession(meta, durableEvents),
   });
   provideSubagents(ctx);
   ctx.provide("logger", { warn: () => {} });
   apply(ctx);
+  const rpcHandler = createContinueRpcHandler(ctx);
 
   const status = await rpcHandler("status", { sessionId: String(sessionId) }, controller.signal);
   const result = await rpcHandler("resume", {
@@ -1777,8 +1797,8 @@ test("cold resume restores the recorded preset and logged model selection", asyn
   let live = false;
   let disposeCalls = 0;
   let mountedPreset;
-  let rpcHandler;
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agentDefaultModel", {
     currentSelection: () => ({ provider: "default-provider", model: "default-model" }),
   });
@@ -1853,21 +1873,15 @@ test("cold resume restores the recorded preset and logged model selection", asyn
       };
     },
   });
-  ctx.provide("connection", {
-    rpc: {
-      handle: (_channel, handler) => {
-        rpcHandler = handler;
-        return async () => {};
-      },
-    },
-  });
+  ctx.provide("connection", { requestRejection: () => undefined });
   ctx.provide("sessionPersistence", {
-    list: async () => [meta],
-    inspect: async () => ({ meta, inheritedEventCount: 0, events }),
+    stat: async () => ({ header: meta, revision: 0 }),
+    open: async () => fakeStoredSession(meta, events),
   });
   provideSubagents(ctx);
   ctx.provide("logger", { warn: () => {} });
   apply(ctx);
+  const rpcHandler = createContinueRpcHandler(ctx);
 
   const signal = new AbortController().signal;
   const status = await rpcHandler("status", { sessionId: String(sessionId) }, signal);
@@ -1891,7 +1905,6 @@ test("shutdown rolls back a cold Agent before publication", async () => {
   const sessionId = SessionId("cold-stalled-restoration");
   const session = sessionWithReason({ kind: "interrupted" });
   const meta = { id: sessionId, cwd: "C:/workspace" };
-  let rpcHandler;
   let published = false;
   let releaseResume;
   const resumeGate = new Promise((resolve) => {
@@ -1906,6 +1919,7 @@ test("shutdown rolls back a cold Agent before publication", async () => {
     reportResumeFinished = resolve;
   });
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agentDefaultModel", {
     currentSelection: () => ({ provider: "test-provider", model: "test-model" }),
   });
@@ -1933,21 +1947,15 @@ test("shutdown rolls back a cold Agent before publication", async () => {
       }
     },
   });
-  ctx.provide("connection", {
-    rpc: {
-      handle: (_channel, handler) => {
-        rpcHandler = handler;
-        return async () => {};
-      },
-    },
-  });
+  ctx.provide("connection", { requestRejection: () => undefined });
   ctx.provide("sessionPersistence", {
-    list: async () => [meta],
-    inspect: async () => ({ meta, inheritedEventCount: 0, events: session.snapshotEvents() }),
+    stat: async () => ({ header: meta, revision: 0 }),
+    open: async () => fakeStoredSession(meta, session.snapshotEvents()),
   });
   provideSubagents(ctx);
   ctx.provide("logger", { warn: () => {} });
   apply(ctx);
+  const rpcHandler = createContinueRpcHandler(ctx);
 
   const signal = new AbortController().signal;
   const status = await rpcHandler("status", { sessionId: String(sessionId) }, signal);
@@ -1988,24 +1996,17 @@ test("shutdown completes while subagent status lookup ignores cancellation", asy
     [String(parentId), parent],
     [String(childId), child],
   ]);
-  let rpcHandler;
   let reportLookup;
   const lookupStarted = new Promise((resolve) => {
     reportLookup = resolve;
   });
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", {
     list: () => [parent, child],
     get: (id) => agents.get(String(id)),
   });
-  ctx.provide("connection", {
-    rpc: {
-      handle: (_channel, handler) => {
-        rpcHandler = handler;
-        return async () => {};
-      },
-    },
-  });
+  ctx.provide("connection", { requestRejection: () => undefined });
   ctx.provide("apiProxy", { sessions: {} });
   provideSubagents(ctx, {
     listChildren: async () => {
@@ -2016,6 +2017,7 @@ test("shutdown completes while subagent status lookup ignores cancellation", asy
   });
   ctx.provide("logger", { warn: () => {} });
   apply(ctx);
+  const rpcHandler = createContinueRpcHandler(ctx);
 
   const status = rpcHandler(
     "status",
@@ -2038,6 +2040,7 @@ test("plugin disposal does not wait for an active ordinary continuation", async 
   agent.wakeDriver = () => {};
   agent.whenIdle = () => neverIdle;
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", { list: () => [agent], get: () => agent });
   ctx.provide("connection", { rpc: { handle: () => () => {} } });
   ctx.provide("apiProxy", { sessions: {} });
@@ -2082,33 +2085,28 @@ test("RPC shutdown cancels an admitted marker before restoring the Agent boundar
     [String(parentId), parent],
     [String(childId), child],
   ]);
-  let rpcHandler;
-  let rpcReleased = false;
+  let routeReleased = false;
   let reportFollowup;
   const followupAccepted = new Promise((resolve) => {
     reportFollowup = resolve;
   });
   const ctx = new Context();
+  ctx.provide("webServer", {
+    register: () => () => {
+      routeReleased = true;
+    },
+  });
   ctx.provide("agents", {
     list: () => [parent, child],
     get: (id) => agents.get(String(id)),
   });
-  ctx.provide("connection", {
-    rpc: {
-      handle: (_channel, handler) => {
-        rpcHandler = handler;
-        return async () => {
-          rpcReleased = true;
-        };
-      },
-    },
-  });
+  ctx.provide("connection", { requestRejection: () => undefined });
   ctx.provide("apiProxy", { sessions: {} });
   provideSubagents(ctx, {
     listChildren: async () => [
       { kind: "child", id: childId, activity: "inactive", hasChildren: false, mode: "continuable", label: "shutdown" },
     ],
-    [queueSubagentPrompt]: async (_parent, _childId, _content, source) => {
+    [deliverSubagentPrompt]: async (_parent, _childId, _content, source) => {
       child.inbox.nextTurn.push({
         id: "shutdown-marker",
         role: "user",
@@ -2122,6 +2120,7 @@ test("RPC shutdown cancels an admitted marker before restoring the Agent boundar
   });
   ctx.provide("logger", { warn: () => {} });
   apply(ctx);
+  const rpcHandler = createContinueRpcHandler(ctx);
 
   const signal = new AbortController().signal;
   const status = await rpcHandler("status", { sessionId: String(childId) }, signal);
@@ -2137,7 +2136,7 @@ test("RPC shutdown cancels an admitted marker before restoring the Agent boundar
 
   assert.equal(result.ok, false);
   assert.equal(result.error.code, "cancelled");
-  assert.equal(rpcReleased, true);
+  assert.equal(routeReleased, true);
   assert.deepEqual(removed, ["shutdown-marker"]);
   assert.deepEqual(child.inbox.nextTurn, []);
   assert.equal(child.preStep, originalPreStep);
@@ -2158,6 +2157,7 @@ test("plugin disposal clears a legacy session marker without driving it", async 
     wakeCalls += 1;
   };
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", { list: () => [agent], get: () => agent });
   ctx.provide("connection", { rpc: { handle: () => () => {} } });
   ctx.provide("apiProxy", { sessions: {} });
@@ -2186,6 +2186,7 @@ test("plugin disposal cancels an unconsumed subagent marker safely", async () =>
     wakeCalls += 1;
   };
   const ctx = new Context();
+  ctx.provide("webServer", { register: () => () => {} });
   ctx.provide("agents", { list: () => [agent], get: () => agent });
   ctx.provide("connection", { rpc: { handle: () => () => {} } });
   ctx.provide("apiProxy", { sessions: {} });
@@ -2202,14 +2203,13 @@ test("plugin disposal cancels an unconsumed subagent marker safely", async () =>
 test("plugin disposal releases its RPC channel", async () => {
   let released = false;
   const ctx = new Context();
-  ctx.provide("agents", { list: () => [], get: () => undefined });
-  ctx.provide("connection", {
-    rpc: {
-      handle: () => async () => {
-        released = true;
-      },
+  ctx.provide("webServer", {
+    register: () => () => {
+      released = true;
     },
   });
+  ctx.provide("agents", { list: () => [], get: () => undefined });
+  ctx.provide("connection", { requestRejection: () => undefined });
   ctx.provide("apiProxy", { sessions: {} });
   ctx.provide("logger", { warn: () => {} });
   apply(ctx);
