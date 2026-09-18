@@ -87,20 +87,19 @@ window.__ModuleLoader__.load({
     }
 
     function canAskHost(session, input) {
-      const pass = session !== undefined
+      return session !== undefined
         && input !== undefined
         && input.phase === "plain"
         && input.draft === ""
-        && input.attachmentIds.length === 0
-        && input.queue.length === 0
+        && (input.attachmentIds?.length ?? 0) === 0
+        && (input.queue?.length ?? 0) === 0
         && session.removed !== true
         && session.blank !== true
         && session.openState === "open"
         && session.running !== true
         && canContinueSubagent(session)
-        && session.pendingSubmissions.length === 0
-        && session.queue.length === 0;
-      return pass;
+        && (session.pendingSubmissions?.length ?? 0) === 0
+        && (session.queue?.length ?? 0) === 0;
     }
 
     const ContinueControl = memo(function ContinueControl({
