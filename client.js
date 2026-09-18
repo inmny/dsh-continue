@@ -67,7 +67,7 @@ window.__ModuleLoader__.load({
     function isStatus(value) {
       return isObject(value)
         && typeof value.available === "boolean"
-        && ["request-error", "interrupted", "max-tokens", "disposed", "none"].includes(value.reason)
+        && ["request-error", "interrupted", "max-tokens", "disposed", "user", "none"].includes(value.reason)
         && (value.turn === undefined || Number.isSafeInteger(value.turn))
         && (value.boundarySeq === undefined || Number.isSafeInteger(value.boundarySeq));
     }
@@ -87,28 +87,31 @@ window.__ModuleLoader__.load({
     }
 
     function canAskHost(session, input) {
-      return session !== undefined
+      const pass = session !== undefined
         && input !== undefined
         && input.phase === "plain"
         && input.draft === ""
-        && input.imageIds.length === 0
+        && input.attachmentIds.length === 0
         && input.queue.length === 0
         && session.removed !== true
         && session.blank !== true
         && session.openState === "open"
         && session.running !== true
         && canContinueSubagent(session)
-        && session.pending.length === 0
+        && session.pendingSubmissions.length === 0
         && session.queue.length === 0;
+      return pass;
     }
 
     const ContinueControl = memo(function ContinueControl({
       connection,
-      input,
-      session,
       sessionId,
+      useSession,
+      useInput,
       t,
     }) {
+      const session = useSession((s) => s);
+      const input = useInput((s) => s);
       const [status, setStatus] = useState(null);
       const [loading, setLoading] = useState(false);
       const [accepted, setAccepted] = useState(false);
@@ -119,8 +122,6 @@ window.__ModuleLoader__.load({
       });
 
       const tailKey = useMemo(() => {
-        const order = session?.chat?.order;
-        const tail = Array.isArray(order) && order.length > 0 ? order[order.length - 1] : "";
         return [
           session?.running === true,
           session?.removed === true,
@@ -131,13 +132,12 @@ window.__ModuleLoader__.load({
           session?.subagent?.address?.childSessionId ?? "",
           session?.subagent?.parentAvailable === true,
           session?.lastAgentError ?? "",
-          session?.pending?.length ?? 0,
+          session?.pendingSubmissions?.length ?? 0,
           session?.queue?.length ?? 0,
           input?.phase,
           input?.draft ?? "",
-          input?.imageIds?.length ?? 0,
+          input?.attachmentIds?.length ?? 0,
           input?.queue?.length ?? 0,
-          tail,
         ].join("|");
       }, [session, input]);
 
@@ -225,9 +225,9 @@ window.__ModuleLoader__.load({
         }, error);
       }
       const isSubagent = session?.subagent !== null;
-       const label = loading
-         ? t(isSubagent ? "continuingSubagent" : "continuing")
-         : t(isSubagent ? "continueSubagent" : "continue");
+      const label = loading
+        ? t(isSubagent ? "continuingSubagent" : "continuing")
+        : t(isSubagent ? "continueSubagent" : "continue");
       return createElement("span", {
         className: "dsh-continue-wrap",
         title: error ?? undefined,
@@ -260,9 +260,9 @@ window.__ModuleLoader__.load({
         locale: NS,
       }, (props) => createElement(ContinueControl, {
         connection: ctx.connection,
-        session: props.session,
-        input: props.input,
         sessionId: props.sessionId,
+        useSession: props.useSession,
+        useInput: props.useInput,
         t: props.t,
       })));
     }
