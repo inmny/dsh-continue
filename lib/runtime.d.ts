@@ -5,7 +5,7 @@ import { type SessionEvent } from "@deepseek-ai/dsh-session";
 export declare const name = "continue";
 export declare const inject: string[];
 export declare const RPC_CHANNEL = "/dsh-continue";
-type ContinueReason = "request-error" | "interrupted" | "max-tokens" | "disposed" | "none";
+type ContinueReason = "request-error" | "interrupted" | "max-tokens" | "disposed" | "user" | "none";
 export interface ContinueStatus {
     readonly available: boolean;
     readonly reason: ContinueReason;

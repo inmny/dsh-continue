@@ -51,7 +51,7 @@ const CONTINUE_WAKE_PREFIX = "dsh-continue:";
 const SUBAGENT_WAKE_PREFIX = "dsh-continue:subagent:";
 const PATCH_STATE = Symbol.for("dsh-continue.agent-wake-patch.v2");
 
-type ContinueReason = "request-error" | "interrupted" | "max-tokens" | "disposed" | "none";
+type ContinueReason = "request-error" | "interrupted" | "max-tokens" | "disposed" | "user" | "none";
 
 type InternalDecision = {
   readonly kind: "reject";
@@ -544,6 +544,7 @@ function reasonFromTurnEnd(event: SessionEvent): ContinueReason {
   if (reason.kind === "interrupted") return "interrupted";
   if (reason.kind === "max-tokens") return "max-tokens";
   if (reason.kind === "aborted" && reason.reason.kind === "disposed") return "disposed";
+  if (reason.kind === "aborted" && reason.reason.kind === "user") return "user";
   return "none";
 }
 

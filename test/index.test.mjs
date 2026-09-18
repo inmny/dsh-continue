@@ -164,12 +164,14 @@ test("classifies abnormal turn endings as continuable", () => {
   }).snapshotEvents()).reason, "disposed");
 });
 
-test("completed and user-aborted turns are not continuable", () => {
+test("user-aborted turns are continuable; completed turns are not", () => {
   assert.equal(continueStatusFromEvents(sessionWithReason({ kind: "completed" }).snapshotEvents()).available, false);
-  assert.equal(continueStatusFromEvents(sessionWithReason({
+  const userAborted = continueStatusFromEvents(sessionWithReason({
     kind: "aborted",
     reason: { kind: "user" },
-  }).snapshotEvents()).available, false);
+  }).snapshotEvents());
+  assert.equal(userAborted.available, true);
+  assert.equal(userAborted.reason, "user");
 });
 
 test("an open turn is treated as a crash tail", () => {
