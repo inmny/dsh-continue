@@ -15,7 +15,7 @@
 
 要求：
 
-- DeepSeek Harness `0.1.1-rc.1`
+- DeepSeek Harness `0.1.7-rc.1`
 - Node.js 24 或更高版本
 - 本机已经配置 GitHub SSH 访问
 

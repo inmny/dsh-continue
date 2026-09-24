@@ -11,11 +11,28 @@ window.__ModuleLoader__.load({
       useRef,
       useState,
     } = require("react");
-    const {
-      IconLoadingOutline16,
-      IconPlayOutline16,
-      Tooltip,
-    } = require("@deepseek-ai/dsh-client-ui-primitives");
+    const primitives = require("@deepseek-ai/dsh-client-ui-primitives");
+    const { Tooltip } = primitives;
+    // dsh >= 0.1.5 renamed the size-suffixed icons (`*Outline16`) to
+    // stroke-weight-suffixed ones (`*OutlineRegular` / `*OutlineMedium`).
+    // Resolve across the naming schemes and fall back to a glyph so a future
+    // rename degrades this control instead of crashing the whole slot.
+    const OutlineIcon = (regular, medium, legacy) =>
+      primitives[regular] ?? primitives[medium] ?? primitives[legacy] ?? null;
+    const IconLoading = OutlineIcon(
+      "IconLoadingOutlineRegular",
+      "IconLoadingOutlineMedium",
+      "IconLoadingOutline16",
+    );
+    const IconPlay = OutlineIcon(
+      "IconPlayOutlineRegular",
+      "IconPlayOutlineMedium",
+      "IconPlayOutline16",
+    );
+    const IconGlyph = ({ children }) => createElement("span", {
+      style: { fontSize: "13px", lineHeight: 1 },
+      "aria-hidden": true,
+    }, children);
 
     const NS = "dsh-continue";
     const SLOT = "conversation.input.right";
@@ -241,7 +258,11 @@ window.__ModuleLoader__.load({
         "aria-label": label,
         disabled: loading,
         onClick: continueRun,
-      }, createElement(loading ? IconLoadingOutline16 : IconPlayOutline16, { size: 15 }))),
+      }, loading
+        ? createElement(IconLoading ?? IconGlyph, { size: 15 },
+          IconLoading === null ? "◌" : undefined)
+        : createElement(IconPlay ?? IconGlyph, { size: 15 },
+          IconPlay === null ? "▶" : undefined))),
       error !== null ? createElement("span", {
         className: "dsh-continue-error",
         role: "alert",
