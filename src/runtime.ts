@@ -19,7 +19,7 @@ import type {} from "@deepseek-ai/dsh-session-persistence";
 import type { SessionHandle } from "@deepseek-ai/dsh-session-persistence";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { MessageSource } from "@deepseek-ai/dsh-llm";
-import type { SubagentListEntry } from "@deepseek-ai/dsh-subagent";
+import type { SubagentCatalogEntry } from "@deepseek-ai/dsh-subagent";
 import { queueHostSubagentPrompt } from "@deepseek-ai/dsh-subagent/internal";
 import {
   foldRequestHeader,
@@ -135,8 +135,7 @@ type ResolvedContinueStatus = ContinueStatus & {
   readonly parentSessionId?: ReturnType<typeof SessionId>;
 };
 
-type ChildEntry = Extract<SubagentListEntry, { kind: "child" }>;
-type ContinuableChildEntry = Extract<ChildEntry, { mode: "continuable" }>;
+type ContinuableChildEntry = Extract<SubagentCatalogEntry, { mode: "continuable" }>;
 
 type SessionState = {
   readonly header: SessionHeader;
@@ -939,8 +938,8 @@ export function startContinuation(agent: Agent): boolean {
   }
 }
 
-function isContinuableChild(entry: SubagentListEntry): entry is ContinuableChildEntry {
-  return entry.kind === "child" && entry.mode === "continuable";
+function isContinuableChild(entry: SubagentCatalogEntry): entry is ContinuableChildEntry {
+  return entry.mode === "continuable";
 }
 
 function sessionStateFromAgent(agent: Agent): SessionState {
@@ -1464,7 +1463,7 @@ export function createContinueRpcHandler(ctx: Context): ConnectionRpcHandler {
   const inFlight = new Set<string>();
   const parentInFlight = new Set<string>();
 
-  const handle: ConnectionRpcHandler = async (endpoint, payload, signal) => {
+  const handle: ConnectionRpcHandler = async (endpoint, payload, signal, _peer) => {
     if (endpoint === ENDPOINT_STATUS) {
       const rawSessionId = decodeStatusPayload(payload);
       if (rawSessionId === undefined) return badRequest("dsh-continue: invalid status payload");
@@ -1566,7 +1565,7 @@ export function createContinueRpcHandler(ctx: Context): ConnectionRpcHandler {
     }
   };
 
-  return async (endpoint, payload, signal) => {
+  return async (endpoint, payload, signal, peer) => {
     if (runtime.shuttingDown) return cancelled();
     let settleRequest!: () => void;
     const activeRequest = new Promise<void>((resolve) => {
@@ -1578,7 +1577,7 @@ export function createContinueRpcHandler(ctx: Context): ConnectionRpcHandler {
       const operationSignal = AbortSignal.any([signal, runtime.shutdown.signal]);
       try {
         return await awaitWithSignal(
-          handle(endpoint, payload, operationSignal),
+          handle(endpoint, payload, operationSignal, peer),
           operationSignal,
         );
       } catch (error) {
@@ -1626,11 +1625,13 @@ export function apply(ctx: Context): void {
     releasePatch(agent, state);
   };
 
-  // `agent/created` fires synchronously during publication, before an Agent's
-  // loop can take a step, so it also covers continuable children created or
-  // cold-resumed by the subagent service.
+  // `agent/created` is async-serial: the listener must resolve to `undefined`,
+  // and returning it keeps the serial initialization handoff well-typed.
   for (const agent of ctx.agents.list()) install({ agent });
-  ctx.on("agent/created", install);
+  ctx.on("agent/created", ({ agent }) => {
+    install({ agent });
+    return undefined;
+  });
   ctx.on("agent/status", ({ agent, status }) => {
     if (status === "idle") cleanupLegacyWakesWhenIdle(agent);
   });
@@ -1768,7 +1769,7 @@ async function serveChannelRpc(
   }
   let result: ConnectionRpcResult<unknown>;
   try {
-    result = await handler(endpoint, message.payload, abort.signal);
+    result = await handler(endpoint, message.payload, abort.signal, connection.operator);
   } catch (error) {
     res.writeHead(500);
     res.end(`handler failure: ${String(error)}`);
