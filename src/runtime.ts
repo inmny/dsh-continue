@@ -1769,7 +1769,7 @@ async function serveChannelRpc(
   }
   let result: ConnectionRpcResult<unknown>;
   try {
-    result = await handler(endpoint, message.payload, abort.signal, connection.operator);
+    result = await handler(endpoint, message.payload, abort.signal, connection.browserPeer);
   } catch (error) {
     res.writeHead(500);
     res.end(`handler failure: ${String(error)}`);
